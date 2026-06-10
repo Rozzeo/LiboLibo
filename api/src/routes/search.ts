@@ -12,12 +12,16 @@ const MAX_QUERY_LEN = 200;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
 
-// Порог косинусной БЛИЗОСТИ (1 - distance). e5 для русского даёт ~0.78+ на
-// релевантных парах, поэтому 0.75 отсекает явный шум. Вынесено в env для
-// тюнинга без передеплоя; guard на NaN — мусор в env откатывается на дефолт.
+// Порог косинусной БЛИЗОСТИ (1 - distance). e5 сжимает score в узкую полосу:
+// на локальном замере (рус. запросы) релевантные пары дают 0.86-0.88,
+// нерелевантные - 0.78-0.81, так что 0.75 не отсекал бы ничего. Зазор
+// проходит около 0.84; тюнить по реальному корпусу через env без передеплоя.
+// Guard на NaN - мусор в env откатывается на дефолт.
+const DEFAULT_MIN_SCORE = 0.84;
+
 function readMinScore(): number {
-  const n = Number(process.env.SEMANTIC_MIN_SCORE ?? "0.75");
-  return Number.isFinite(n) ? n : 0.75;
+  const n = Number(process.env.SEMANTIC_MIN_SCORE ?? DEFAULT_MIN_SCORE);
+  return Number.isFinite(n) ? n : DEFAULT_MIN_SCORE;
 }
 
 interface SemanticBody {

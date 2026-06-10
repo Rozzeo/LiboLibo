@@ -27,7 +27,8 @@
     "express": "^4.21.1",
     "fast-xml-parser": "^4.5.0",
     "image-size": "^2.0.2",
-    "multer": "^2.1.1"
+    "multer": "^2.1.1",
+    "pgvector": "^0.2.1"
   },
   "devDependencies": {
     "@types/basic-auth": "^1.1.8",

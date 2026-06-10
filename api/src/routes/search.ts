@@ -108,10 +108,10 @@ searchRouter.post(
 searchRouter.get(
   "/search/semantic/status",
   asyncHandler(async (_req, res) => {
-    const [{ count }] = await prisma.$queryRaw<{ count: bigint }[]>`
+    const rows = await prisma.$queryRaw<{ count: bigint }[]>`
       SELECT COUNT(*)::bigint AS count FROM episodes WHERE embedding IS NOT NULL
     `;
-    res.json({ indexed: Number(count) });
+    res.json({ indexed: Number(rows[0]?.count ?? 0n) });
   }),
 );
 

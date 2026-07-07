@@ -1,37 +1,28 @@
 import { Router } from "express";
-import pgvector from "pgvector";
 import { prisma } from "../db.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 import { episodeToDTO } from "../lib/serialize.js";
 import { resolveViewer } from "../middleware/viewer.js";
-import { embedQuery } from "../lib/semanticSearch.js";
+import {
+  ensureIndexed,
+  semanticSearch,
+  indexSize,
+} from "../lib/semanticSearch.js";
 
 export const searchRouter = Router();
 
 const MAX_QUERY_LEN = 200;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
-
-// Порог косинусной БЛИЗОСТИ (1 - distance). e5 сжимает score в узкую полосу:
-// на локальном замере (рус. запросы) релевантные пары дают 0.86-0.88,
-// нерелевантные - 0.78-0.81, так что 0.75 не отсекал бы ничего. Зазор
-// проходит около 0.84; тюнить по реальному корпусу через env без передеплоя.
-// Guard на NaN - мусор в env откатывается на дефолт.
-const DEFAULT_MIN_SCORE = 0.84;
-
-function readMinScore(): number {
-  const n = Number(process.env.SEMANTIC_MIN_SCORE ?? DEFAULT_MIN_SCORE);
-  return Number.isFinite(n) ? n : DEFAULT_MIN_SCORE;
-}
+// Порог косинусной близости. Ниже него выдача — шум: e5 для русского даёт
+// ~0.78+ на релевантных парах, поэтому 0.75 отсекает явно мимо. Значение
+// подобрано на корпусе Либо-Либо; вынесено в env на случай тюнинга без
+// передеплоя кода.
+const MIN_SCORE = Number(process.env.SEMANTIC_MIN_SCORE ?? "0.75");
 
 interface SemanticBody {
   query?: unknown;
   limit?: unknown;
-}
-
-interface HitRow {
-  id: string;
-  score: number;
 }
 
 // POST /v1/search/semantic — семантический поиск по выпускам всех подкастов.
@@ -42,8 +33,8 @@ interface HitRow {
 // Ответ: { "items": EpisodeDTO[] } — тот же формат, что /v1/feed, чтобы
 // клиент переиспользовал существующую модель Episode и рендер ячеек.
 //
-// Эмбеддинги эпизодов лежат в Postgres (pgvector) и считаются cron-refresh'ем
-// заранее — здесь только эмбеддинг запроса и один SQL-запрос с <=>.
+// Если модель ещё не готова (не скачалась/пакет не установлен) — 503, и
+// клиент откатывается на обычный текстовый поиск.
 searchRouter.post(
   "/search/semantic",
   resolveViewer,
@@ -59,47 +50,45 @@ searchRouter.post(
     }
 
     const limit = clampLimit(body.limit);
-    const minScore = readMinScore();
 
-    // Эмбеддинг запроса. Если модель недоступна (пакет не установлен, не
-    // скачалась) — 503, клиент откатывается на текстовый поиск.
-    let queryVec: number[];
+    // Кандидаты для индекса: все эпизоды с непустым summary/title. Тянем
+    // минимум полей — id/title/summary хватает для эмбеддинга.
+    const forIndex = await prisma.episode.findMany({
+      select: { id: true, title: true, summary: true },
+    });
+
     try {
-      queryVec = await embedQuery(query);
+      await ensureIndexed(
+        forIndex.map((e) => ({
+          id: e.id,
+          title: e.title,
+          summary: e.summary ?? "",
+        })),
+      );
     } catch (err) {
+      // Модель недоступна (не установлен пакет, не скачалась модель и т.п.).
+      // Не валим запрос 500-кой — отдаём 503, клиент знает, что нужно
+      // откатиться на текстовый поиск.
       console.error("[search/semantic] model unavailable:", err);
       return res.status(503).json({ error: "semantic_unavailable" });
     }
 
-    // pgvector: <=> — косинусная ДИСТАНЦИЯ (0 = идентичны, 2 = противоположны),
-    // score = 1 - distance. Фильтруем по minScore, сортируем по дистанции,
-    // режем по limit. Один запрос, без скана корпуса в память. Premium-эпизоды
-    // ранжируются наравне — audio_url гейтится в episodeToDTO как везде.
-    const vecSql = pgvector.toSql(queryVec);
-    const rows = await prisma.$queryRaw<HitRow[]>`
-      SELECT id, 1 - (embedding <=> ${vecSql}::vector) AS score
-      FROM episodes
-      WHERE embedding IS NOT NULL
-        AND 1 - (embedding <=> ${vecSql}::vector) >= ${minScore}
-      ORDER BY embedding <=> ${vecSql}::vector
-      LIMIT ${limit}
-    `;
-
-    if (rows.length === 0) {
+    const hits = await semanticSearch(query, { limit, minScore: MIN_SCORE });
+    if (hits.length === 0) {
       return res.json({ items: [] });
     }
 
-    // Дотягиваем полные эпизоды + podcast, сохраняя порядок ранжирования
-    // (Prisma вернёт строки в произвольном порядке).
-    const ids = rows.map((r) => r.id);
+    // Дотягиваем полные эпизоды из БД и сериализуем как везде, сохраняя
+    // порядок ранжирования (Prisma вернёт в произвольном порядке).
+    const ids = hits.map((h) => h.episodeId);
     const episodes = await prisma.episode.findMany({
       where: { id: { in: ids } },
       include: { podcast: { select: { name: true, artworkUrl: true } } },
     });
     const byId = new Map(episodes.map((e) => [e.id, e]));
 
-    const items = rows
-      .map((r) => byId.get(r.id))
+    const items = hits
+      .map((h) => byId.get(h.episodeId))
       .filter((e): e is NonNullable<typeof e> => e != null)
       .map((e) => episodeToDTO(e, e.podcast, req.viewer));
 
@@ -107,15 +96,13 @@ searchRouter.post(
   }),
 );
 
-// GET /v1/search/semantic/status — диагностика: сколько эпизодов
-// проиндексировано. Удобно для health-проверки фичи на проде.
+// GET /v1/search/semantic/status — небольшая диагностика: готова ли модель и
+// сколько эпизодов проиндексировано. Удобно для health-проверки фичи на
+// проде и для отладки на стриме.
 searchRouter.get(
   "/search/semantic/status",
   asyncHandler(async (_req, res) => {
-    const rows = await prisma.$queryRaw<{ count: bigint }[]>`
-      SELECT COUNT(*)::bigint AS count FROM episodes WHERE embedding IS NOT NULL
-    `;
-    res.json({ indexed: Number(rows[0]?.count ?? 0n) });
+    res.json({ indexed: indexSize() });
   }),
 );
 
